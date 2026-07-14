@@ -3,6 +3,23 @@ For experiments, the same workflow is intentionally lightweight; for production 
 
 # agent-fleet-control
 
+| | |
+|---|---|
+| **Problem** | Concurrent agents in one checkout can overwrite each other and invalidate the state they verified |
+| **Theory** | [Worktree isolation](https://code.claude.com/docs/en/worktrees) gives concurrent writers separate working copies |
+| **This tool** | A local CLI assigns territory and worktrees then binds verification evidence and receipts to commits |
+
+```mermaid
+flowchart LR
+  A[Task contract] --> B[Territory collision check]
+  B --> C[One worktree per writer]
+  C --> D[Clean commit verification]
+  D --> E[Immutable evidence]
+  E --> F[Review receipt]
+  F --> G[Human merge owner]
+```
+
+
 Multiple coding agents need separate worktrees, explicit territory, and receipts. This dependency-free CLI turns those constraints into local, inspectable artifacts without ever pushing or merging.
 
 ## The two-agent overwrite incident
