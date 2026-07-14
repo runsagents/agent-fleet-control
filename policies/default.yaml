@@ -1,0 +1,19 @@
+version: 1
+policy_name: default
+writers:
+  one_per_worktree: true
+  require_explicit_paths: true
+  reject_overlapping_paths: true
+  allow_human_override: true
+verification:
+  required_before_receipt: true
+  must_match_current_commit: true
+receipts:
+  require_reviewer_identity: true
+  require_unresolved_risks: true
+git:
+  allow_create_branch: true
+  allow_create_worktree: true
+  allow_commit: false
+  allow_merge: false
+  allow_push: false

@@ -1,0 +1,580 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 077
+
+PROGRAM=${0##*/}
+STATE_DIR=
+REPO_ROOT=
+LOCK_HELD=0
+NEW_PENDING=0
+NEW_BRANCH=
+NEW_WORKTREE=
+NEW_CONTRACT=
+
+usage() {
+  cat <<'USAGE'
+agent-fleet-control: isolate writers, assign territory, and require receipts.
+
+Usage:
+  agent-fleet new <agent> <task> --path <repo-path> [--path <repo-path> ...]
+      --acceptance <criterion> [--acceptance <criterion> ...]
+      --verify <command> [--override]
+  agent-fleet verify <agent>
+  agent-fleet receipt <agent> --reviewer <identity>
+      --risk <unresolved-risk> [--risk <unresolved-risk> ...]
+  agent-fleet help
+
+The command creates branches and worktrees, but never commits, pushes, or merges.
+USAGE
+}
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+require_value() {
+  local flag=$1
+  local value=${2-}
+  [[ -n "$value" ]] || die "$flag requires a non-empty value"
+  [[ "$value" != *[[:cntrl:]]* ]] || die "$flag must be a single line without control characters"
+}
+
+validate_agent() {
+  local agent=$1
+  [[ "$agent" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || \
+    die "agent must match [A-Za-z0-9][A-Za-z0-9._-]*"
+  git check-ref-format --branch "fleet/$agent" >/dev/null 2>&1 || die "agent does not form a valid Git branch"
+}
+
+normalize_path() {
+  local input=$1
+  local component
+  local -a components
+  require_value "--path" "$input"
+  [[ "$input" != /* ]] || die "territory paths must be repository-relative: $input"
+  input=${input#./}
+  while [[ "$input" == */ ]]; do input=${input%/}; done
+  [[ -n "$input" ]] || die "territory cannot be the repository root"
+  IFS='/' read -r -a components <<<"$input"
+  for component in "${components[@]}"; do
+    [[ -n "$component" && "$component" != "." && "$component" != ".." ]] || \
+      die "territory contains an unsafe path component: $input"
+  done
+  printf '%s\n' "$input"
+}
+
+resolve_repo() {
+  git rev-parse --is-inside-work-tree >/dev/null 2>&1 || die "run this command inside a Git worktree"
+  REPO_ROOT=$(git worktree list --porcelain | sed -n '1s/^worktree //p')
+  [[ -n "$REPO_ROOT" ]] || die "could not locate the primary Git worktree"
+  STATE_DIR="$REPO_ROOT/.agent-fleet"
+}
+
+ensure_state() {
+  local exclude
+  mkdir -p "$STATE_DIR/contracts" "$STATE_DIR/receipts" "$STATE_DIR/worktrees"
+  exclude=$(git -C "$REPO_ROOT" rev-parse --git-path info/exclude)
+  [[ "$exclude" == /* ]] || exclude="$REPO_ROOT/$exclude"
+  mkdir -p "$(dirname "$exclude")"
+  touch "$exclude"
+  if ! grep -Fxq '.agent-fleet/' "$exclude"; then
+    printf '%s\n' '.agent-fleet/' >>"$exclude"
+  fi
+}
+
+acquire_lock() {
+  ensure_state
+  if ! mkdir "$STATE_DIR/.lock" 2>/dev/null; then
+    die "fleet state is locked; if no agent-fleet process is running, remove $STATE_DIR/.lock"
+  fi
+  LOCK_HELD=1
+  printf '%s\n' "$$" >"$STATE_DIR/.lock/pid"
+  trap release_lock EXIT
+  trap 'release_lock; exit 129' HUP
+  trap 'release_lock; exit 130' INT
+  trap 'release_lock; exit 143' TERM
+}
+
+release_lock() {
+  if [[ "$NEW_PENDING" -eq 1 ]]; then
+    git -C "$REPO_ROOT" worktree remove --force "$NEW_WORKTREE" >/dev/null 2>&1 || true
+    rm -rf "$NEW_WORKTREE"
+    git -C "$REPO_ROOT" worktree prune >/dev/null 2>&1 || true
+    if git -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/$NEW_BRANCH"; then
+      git -C "$REPO_ROOT" branch -D "$NEW_BRANCH" >/dev/null 2>&1 || true
+    fi
+    rm -rf "$NEW_CONTRACT"
+    NEW_PENDING=0
+  fi
+  if [[ "$LOCK_HELD" -eq 1 ]]; then
+    rm -rf "$STATE_DIR/.lock"
+    LOCK_HELD=0
+  fi
+}
+
+contract_dir() {
+  printf '%s/contracts/%s\n' "$STATE_DIR" "$1"
+}
+
+require_contract() {
+  local dir
+  dir=$(contract_dir "$1")
+  [[ -d "$dir" ]] || die "no task contract recorded for agent '$1'"
+  printf '%s\n' "$dir"
+}
+
+paths_overlap() {
+  local left=$1
+  local right=$2
+  [[ "$left" == "$right" || "$left" == "$right/"* || "$right" == "$left/"* ]]
+}
+
+json_quote() {
+  local value=$1
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  value=${value//$'\t'/\\t}
+  printf '"%s"' "$value"
+}
+
+write_json_array_file() {
+  local source=$1
+  local indent=$2
+  local first=1
+  local value
+  while IFS= read -r value; do
+    if [[ "$first" -eq 0 ]]; then printf ',\n'; fi
+    printf '%s' "$indent"
+    json_quote "$value"
+    first=0
+  done <"$source"
+  printf '\n'
+}
+
+write_contract_artifacts() {
+  local dir=$1
+  local agent=$2
+  local task=$3
+  local branch=$4
+  local worktree=$5
+  local command=$6
+  local override=$7
+  local created=$8
+  local path
+  local criterion
+
+  {
+    printf '{\n'
+    printf '  "schema_version": 1,\n'
+    printf '  "agent": '; json_quote "$agent"; printf ',\n'
+    printf '  "task": '; json_quote "$task"; printf ',\n'
+    printf '  "branch": '; json_quote "$branch"; printf ',\n'
+    printf '  "worktree": '; json_quote "$worktree"; printf ',\n'
+    printf '  "allowed_paths": [\n'
+    write_json_array_file "$dir/paths" '    '
+    printf '  ],\n'
+    printf '  "acceptance_criteria": [\n'
+    write_json_array_file "$dir/acceptance" '    '
+    printf '  ],\n'
+    printf '  "verification_command": '; json_quote "$command"; printf ',\n'
+    printf '  "collision_override": %s,\n' "$override"
+    printf '  "created_at": '; json_quote "$created"; printf '\n'
+    printf '}\n'
+  } >"$dir/contract.json"
+
+  {
+    printf '# Task contract: %s\n\n' "$agent"
+    printf -- '- Task: %s\n' "$task"
+    printf -- '- Branch: `%s`\n' "$branch"
+    printf -- '- Worktree: `%s`\n' "$worktree"
+    printf -- '- Created: %s\n' "$created"
+    printf -- '- Collision override: %s\n\n' "$override"
+    printf '## Allowed paths\n\n'
+    while IFS= read -r path; do printf -- '- `%s`\n' "$path"; done <"$dir/paths"
+    printf '\n## Acceptance criteria\n\n'
+    while IFS= read -r criterion; do printf -- '- %s\n' "$criterion"; done <"$dir/acceptance"
+    printf '\n## Verification\n\n```sh\n%s\n```\n' "$command"
+  } >"$dir/contract.md"
+}
+
+cmd_new() {
+  [[ $# -ge 2 ]] || { usage >&2; die "new requires <agent> and <task>"; }
+  local agent=$1
+  local task=$2
+  shift 2
+  local -a paths=()
+  local -a criteria=()
+  local command=
+  local override=false
+  local normalized
+  local arg
+  local existing_dir
+  local existing_agent
+  local existing_path
+  local requested_path
+  local branch
+  local worktree
+  local dir
+  local created
+
+  validate_agent "$agent"
+  require_value "task" "$task"
+  while [[ $# -gt 0 ]]; do
+    arg=$1
+    case "$arg" in
+      --path)
+        [[ $# -ge 2 ]] || die "--path requires a value"
+        normalized=$(normalize_path "$2")
+        if [[ ${#paths[@]} -gt 0 ]]; then
+          for requested_path in "${paths[@]}"; do
+            [[ "$requested_path" != "$normalized" ]] || die "duplicate territory path: $normalized"
+          done
+        fi
+        paths+=("$normalized")
+        shift 2
+        ;;
+      --acceptance)
+        [[ $# -ge 2 ]] || die "--acceptance requires a value"
+        require_value "--acceptance" "$2"
+        criteria+=("$2")
+        shift 2
+        ;;
+      --verify)
+        [[ $# -ge 2 ]] || die "--verify requires a value"
+        require_value "--verify" "$2"
+        [[ -z "$command" ]] || die "--verify may be supplied only once"
+        command=$2
+        shift 2
+        ;;
+      --override)
+        override=true
+        shift
+        ;;
+      *) die "unknown new option: $arg" ;;
+    esac
+  done
+  [[ ${#paths[@]} -gt 0 ]] || die "new requires at least one --path"
+  [[ ${#criteria[@]} -gt 0 ]] || die "new requires at least one --acceptance"
+  [[ -n "$command" ]] || die "new requires --verify"
+
+  resolve_repo
+  acquire_lock
+  dir=$(contract_dir "$agent")
+  [[ ! -e "$dir" ]] || die "agent '$agent' already has a task contract"
+
+  if [[ "$override" == false ]]; then
+    for existing_dir in "$STATE_DIR"/contracts/*; do
+      [[ -d "$existing_dir" && -f "$existing_dir/paths" ]] || continue
+      existing_agent=${existing_dir##*/}
+      while IFS= read -r existing_path; do
+        for requested_path in "${paths[@]}"; do
+          if paths_overlap "$existing_path" "$requested_path"; then
+            die "territory collision: '$requested_path' overlaps '$existing_path' owned by '$existing_agent'; use --override only with explicit human approval"
+          fi
+        done
+      done <"$existing_dir/paths"
+    done
+  fi
+
+  branch="fleet/$agent"
+  worktree="$STATE_DIR/worktrees/$agent"
+  [[ ! -e "$worktree" ]] || die "worktree path already exists: $worktree"
+  if git -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/$branch"; then
+    die "branch already exists: $branch"
+  fi
+
+  mkdir -p "$dir"
+  printf '%s\n' "${paths[@]}" >"$dir/paths"
+  printf '%s\n' "${criteria[@]}" >"$dir/acceptance"
+  printf '%s\n' "$task" >"$dir/task"
+  printf '%s\n' "$command" >"$dir/verification.command"
+  printf '%s\n' "$branch" >"$dir/branch"
+  printf '%s\n' "$worktree" >"$dir/worktree"
+  printf '%s\n' "$override" >"$dir/collision_override"
+
+  NEW_PENDING=1
+  NEW_BRANCH=$branch
+  NEW_WORKTREE=$worktree
+  NEW_CONTRACT=$dir
+  if ! git -C "$REPO_ROOT" worktree add -q -b "$branch" "$worktree" HEAD; then
+    die "Git could not create worktree '$worktree' on branch '$branch'"
+  fi
+
+  created=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+  printf '%s\n' "$created" >"$dir/created_at"
+  write_contract_artifacts "$dir" "$agent" "$task" "$branch" "$worktree" "$command" "$override" "$created"
+  NEW_PENDING=0
+
+  printf 'Created writer %s\n' "$agent"
+  printf 'Branch: %s\n' "$branch"
+  printf 'Worktree: %s\n' "$worktree"
+  printf 'Contract: %s\n' "$dir/contract.md"
+  if [[ "$override" == true ]]; then
+    printf 'OVERRIDE RECORDED: overlapping territory checks were bypassed.\n'
+  fi
+}
+
+cmd_verify() {
+  [[ $# -eq 1 ]] || { usage >&2; die "verify requires exactly one <agent>"; }
+  local agent=$1
+  local dir
+  local worktree
+  local command
+  local branch
+  local actual_branch
+  local started
+  local started_stamp
+  local finished
+  local sha
+  local after_sha
+  local after_branch
+  local dirty
+  local after_dirty
+  local exit_code
+  local evidence_dir
+  local evidence_log
+  local evidence_digest
+  local integrity_failed=0
+
+  validate_agent "$agent"
+  resolve_repo
+  acquire_lock
+  dir=$(require_contract "$agent")
+  worktree=$(<"$dir/worktree")
+  command=$(<"$dir/verification.command")
+  branch=$(<"$dir/branch")
+  [[ -d "$worktree" ]] || die "recorded worktree is missing: $worktree"
+  if ! actual_branch=$(git -C "$worktree" symbolic-ref --quiet --short HEAD); then
+    die "recorded worktree is detached; expected branch '$branch'"
+  fi
+  [[ "$actual_branch" == "$branch" ]] || die "recorded worktree is on branch '$actual_branch'; expected '$branch'"
+  dirty=$(git -C "$worktree" status --porcelain --untracked-files=all)
+  [[ -z "$dirty" ]] || die "recorded worktree has uncommitted or untracked changes; commit or clean it before verification"
+  sha=$(git -C "$worktree" rev-parse HEAD)
+  started=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+  started_stamp=$(date -u '+%Y%m%dT%H%M%SZ')
+  evidence_dir="$dir/evidence/$sha-$started_stamp-$$"
+  evidence_log="$evidence_dir/verification.log"
+  mkdir -p "$evidence_dir"
+  printf 'Running verification for %s at %s\n' "$agent" "$sha"
+  printf 'Command: %s\n' "$command"
+
+  set +e
+  (cd "$worktree" && bash -c "$command") >"$evidence_log" 2>&1
+  exit_code=$?
+  set -e
+  after_sha=$(git -C "$worktree" rev-parse HEAD 2>/dev/null) || after_sha=
+  after_branch=$(git -C "$worktree" symbolic-ref --quiet --short HEAD 2>/dev/null) || after_branch=
+  after_dirty=$(git -C "$worktree" status --porcelain --untracked-files=all 2>/dev/null) || after_dirty='<git status unavailable>'
+  if [[ "$after_sha" != "$sha" ]]; then
+    printf '\nagent-fleet integrity gate: HEAD changed during verification.\n' >>"$evidence_log"
+    integrity_failed=1
+  fi
+  if [[ "$after_branch" != "$branch" ]]; then
+    printf '\nagent-fleet integrity gate: branch changed during verification.\n' >>"$evidence_log"
+    integrity_failed=1
+  fi
+  if [[ -n "$after_dirty" ]]; then
+    printf '\nagent-fleet integrity gate: verification left uncommitted or untracked changes.\n%s\n' "$after_dirty" >>"$evidence_log"
+    integrity_failed=1
+  fi
+  if [[ "$integrity_failed" -eq 1 ]]; then
+    exit_code=125
+  fi
+  finished=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+  evidence_digest=$(git -C "$REPO_ROOT" hash-object "$evidence_log")
+  printf '%s\n' "$exit_code" >"$evidence_dir/verification.exit"
+  printf '%s\n' "$sha" >"$evidence_dir/verification.sha"
+  printf '%s\n' "$branch" >"$evidence_dir/verification.branch"
+  printf '%s\n' "$command" >"$evidence_dir/verification.command"
+  printf '%s\n' "$started" >"$evidence_dir/verification.started_at"
+  printf '%s\n' "$finished" >"$evidence_dir/verification.finished_at"
+  printf '%s\n' "$evidence_digest" >"$evidence_dir/verification.digest"
+  chmod 0444 "$evidence_dir"/*
+  rm -f "$dir/verification.log"
+  cp "$evidence_log" "$dir/verification.log"
+  chmod 0600 "$dir/verification.log"
+  printf '%s\n' "$exit_code" >"$dir/verification.exit"
+  printf '%s\n' "$sha" >"$dir/verification.sha"
+  printf '%s\n' "$branch" >"$dir/verification.branch"
+  printf '%s\n' "$started" >"$dir/verification.started_at"
+  printf '%s\n' "$finished" >"$dir/verification.finished_at"
+  printf '%s\n' "$evidence_digest" >"$dir/verification.digest"
+  printf '%s\n' "$evidence_dir" >"$dir/verification.evidence"
+
+  cat "$evidence_log"
+  if [[ "$exit_code" -eq 0 ]]; then
+    printf 'Verification passed (exit 0). Evidence: %s\n' "$evidence_log"
+    return 0
+  fi
+  printf 'Verification failed (exit %s). Evidence: %s\n' "$exit_code" "$evidence_log" >&2
+  return "$exit_code"
+}
+
+write_receipt() {
+  local agent=$1
+  local dir=$2
+  local reviewer=$3
+  local risks_file=$4
+  local sha=$5
+  local branch=$6
+  local worktree=$7
+  local command=$8
+  local evidence_log=$9
+  local evidence_digest=${10}
+  local verified_at=${11}
+  local receipt_md=${12}
+  local receipt_json=${13}
+  local created=${14}
+  local risk
+
+  {
+    printf '{\n'
+    printf '  "schema_version": 1,\n'
+    printf '  "agent": '; json_quote "$agent"; printf ',\n'
+    printf '  "commit_sha": '; json_quote "$sha"; printf ',\n'
+    printf '  "branch": '; json_quote "$branch"; printf ',\n'
+    printf '  "worktree": '; json_quote "$worktree"; printf ',\n'
+    printf '  "reviewer_identity": '; json_quote "$reviewer"; printf ',\n'
+    printf '  "verification_command": '; json_quote "$command"; printf ',\n'
+    printf '  "verification_exit_code": 0,\n'
+    printf '  "verification_evidence": '; json_quote "$evidence_log"; printf ',\n'
+    printf '  "verification_evidence_digest": '; json_quote "$evidence_digest"; printf ',\n'
+    printf '  "verified_at": '; json_quote "$verified_at"; printf ',\n'
+    printf '  "unresolved_risks": [\n'
+    write_json_array_file "$risks_file" '    '
+    printf '  ],\n'
+    printf '  "created_at": '; json_quote "$created"; printf '\n'
+    printf '}\n'
+  } >"$receipt_json"
+
+  {
+    printf '# Merge receipt: %s\n\n' "$agent"
+    printf -- '- Commit: `%s`\n' "$sha"
+    printf -- '- Branch: `%s`\n' "$branch"
+    printf -- '- Worktree: `%s`\n' "$worktree"
+    printf -- '- Reviewer: %s\n' "$reviewer"
+    printf -- '- Receipt created: %s\n\n' "$created"
+    printf '## Verification evidence\n\n'
+    printf -- '- Command: `%s`\n' "$command"
+    printf -- '- Exit code: 0\n'
+    printf -- '- Verified at: %s\n' "$verified_at"
+    printf -- '- Captured output: `%s`\n' "$evidence_log"
+    printf -- '- Evidence digest: `%s`\n\n' "$evidence_digest"
+    printf '## Unresolved risks\n\n'
+    while IFS= read -r risk; do printf -- '- %s\n' "$risk"; done <"$risks_file"
+    printf '\nThis receipt is evidence for human review. It is not an authorization to merge.\n'
+  } >"$receipt_md"
+}
+
+cmd_receipt() {
+  [[ $# -ge 1 ]] || { usage >&2; die "receipt requires <agent>"; }
+  local agent=$1
+  shift
+  local reviewer=
+  local -a risks=()
+  local arg
+  local dir
+  local worktree
+  local branch
+  local actual_branch
+  local command
+  local verified_exit
+  local verified_sha
+  local current_sha
+  local verified_at
+  local evidence_dir
+  local evidence_log
+  local evidence_digest
+  local dirty
+  local created
+  local receipt_stamp
+  local receipt_base
+  local risks_file
+
+  validate_agent "$agent"
+  while [[ $# -gt 0 ]]; do
+    arg=$1
+    case "$arg" in
+      --reviewer)
+        [[ $# -ge 2 ]] || die "--reviewer requires a value"
+        require_value "--reviewer" "$2"
+        [[ -z "$reviewer" ]] || die "--reviewer may be supplied only once"
+        reviewer=$2
+        shift 2
+        ;;
+      --risk)
+        [[ $# -ge 2 ]] || die "--risk requires a value"
+        require_value "--risk" "$2"
+        risks+=("$2")
+        shift 2
+        ;;
+      *) die "unknown receipt option: $arg" ;;
+    esac
+  done
+  [[ -n "$reviewer" ]] || die "receipt requires --reviewer"
+  [[ ${#risks[@]} -gt 0 ]] || die "receipt requires at least one --risk; use 'None reported' when that is the reviewed conclusion"
+
+  resolve_repo
+  acquire_lock
+  dir=$(require_contract "$agent")
+  [[ -f "$dir/verification.evidence" ]] || \
+    die "receipt requires a successful verification first: agent-fleet verify $agent"
+  evidence_dir=$(<"$dir/verification.evidence")
+  case "$evidence_dir" in
+    "$dir/evidence/"*) ;;
+    *) die "recorded verification evidence is outside this agent's contract directory" ;;
+  esac
+  [[ -d "$evidence_dir" ]] || die "recorded verification evidence is missing: $evidence_dir"
+  evidence_log="$evidence_dir/verification.log"
+  [[ -f "$evidence_log" && -f "$evidence_dir/verification.exit" && -f "$evidence_dir/verification.sha" ]] || \
+    die "recorded verification evidence is incomplete: $evidence_dir"
+  verified_exit=$(<"$evidence_dir/verification.exit")
+  [[ "$verified_exit" == 0 ]] || die "receipt requires successful verification; last exit code was $verified_exit"
+  worktree=$(<"$dir/worktree")
+  [[ -d "$worktree" ]] || die "recorded worktree is missing: $worktree"
+  branch=$(<"$dir/branch")
+  if ! actual_branch=$(git -C "$worktree" symbolic-ref --quiet --short HEAD); then
+    die "recorded worktree is detached; expected branch '$branch'"
+  fi
+  [[ "$actual_branch" == "$branch" ]] || die "recorded worktree is on branch '$actual_branch'; expected '$branch'"
+  dirty=$(git -C "$worktree" status --porcelain --untracked-files=all)
+  [[ -z "$dirty" ]] || die "recorded worktree has uncommitted or untracked changes; receipt requires the exact clean commit that passed verification"
+  current_sha=$(git -C "$worktree" rev-parse HEAD)
+  verified_sha=$(<"$evidence_dir/verification.sha")
+  [[ "$current_sha" == "$verified_sha" ]] || \
+    die "verification does not cover the current commit ($current_sha); run agent-fleet verify $agent again"
+
+  command=$(<"$dir/verification.command")
+  [[ "$(<"$evidence_dir/verification.branch")" == "$branch" ]] || die "verification evidence records a different branch"
+  [[ "$(<"$evidence_dir/verification.command")" == "$command" ]] || die "verification evidence records a different command"
+  verified_at=$(<"$evidence_dir/verification.finished_at")
+  evidence_digest=$(<"$evidence_dir/verification.digest")
+  [[ "$(git -C "$REPO_ROOT" hash-object "$evidence_log")" == "$evidence_digest" ]] || die "verification evidence digest does not match its captured output"
+  created=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
+  receipt_stamp=$(date -u '+%Y%m%dT%H%M%SZ')
+  receipt_base="$STATE_DIR/receipts/$agent-$current_sha-$receipt_stamp-$$"
+  risks_file="$dir/receipt.risks"
+  printf '%s\n' "${risks[@]}" >"$risks_file"
+  write_receipt "$agent" "$dir" "$reviewer" "$risks_file" "$current_sha" "$branch" "$worktree" "$command" "$evidence_log" "$evidence_digest" "$verified_at" "$receipt_base.md" "$receipt_base.json" "$created"
+  rm -f "$risks_file"
+
+  printf 'Receipt: %s\n' "$receipt_base.md"
+  printf 'Machine receipt: %s\n' "$receipt_base.json"
+  printf 'No merge or push was performed.\n'
+}
+
+main() {
+  local command=${1-help}
+  if [[ $# -gt 0 ]]; then shift; fi
+  case "$command" in
+    new) cmd_new "$@" ;;
+    verify) cmd_verify "$@" ;;
+    receipt) cmd_receipt "$@" ;;
+    help|-h|--help) usage ;;
+    *) usage >&2; die "unknown command: $command" ;;
+  esac
+}
+
+main "$@"

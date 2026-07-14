@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/runsagents/agent-fleet-control/schemas/merge-receipt.schema.json",
+  "title": "Agent Fleet Merge Receipt",
+  "description": "Verification evidence for a human merge decision; never an automatic merge authorization.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "agent",
+    "commit_sha",
+    "branch",
+    "worktree",
+    "reviewer_identity",
+    "verification_command",
+    "verification_exit_code",
+    "verification_evidence",
+    "verification_evidence_digest",
+    "verified_at",
+    "unresolved_risks",
+    "created_at"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "agent": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "commit_sha": { "type": "string", "pattern": "^[0-9a-f]{40,64}$" },
+    "branch": { "type": "string", "pattern": "^fleet/" },
+    "worktree": { "type": "string", "minLength": 1 },
+    "reviewer_identity": { "type": "string", "minLength": 1 },
+    "verification_command": { "type": "string", "minLength": 1 },
+    "verification_exit_code": { "const": 0 },
+    "verification_evidence": { "type": "string", "minLength": 1 },
+    "verification_evidence_digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40,64}$"
+    },
+    "verified_at": { "type": "string", "format": "date-time" },
+    "unresolved_risks": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "created_at": { "type": "string", "format": "date-time" }
+  }
+}

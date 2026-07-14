@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/runsagents/agent-fleet-control/schemas/task-contract.schema.json",
+  "title": "Agent Fleet Task Contract",
+  "description": "The recorded assignment and territory for one writing agent.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "agent",
+    "task",
+    "branch",
+    "worktree",
+    "allowed_paths",
+    "acceptance_criteria",
+    "verification_command",
+    "collision_override",
+    "created_at"
+  ],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "agent": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._-]*$"
+    },
+    "task": { "type": "string", "minLength": 1 },
+    "branch": { "type": "string", "pattern": "^fleet/" },
+    "worktree": { "type": "string", "minLength": 1 },
+    "allowed_paths": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "not": { "pattern": "(^/)|(^|/)\\.\\.?(/|$)|//|/$" }
+      }
+    },
+    "acceptance_criteria": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "verification_command": { "type": "string", "minLength": 1 },
+    "collision_override": { "type": "boolean" },
+    "created_at": { "type": "string", "format": "date-time" }
+  }
+}
