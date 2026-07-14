@@ -202,3 +202,7 @@ Run the complete suite with `npm test`, or run `bash tests/writer-isolation.sh` 
 This project is a clean-room implementation from its behavior specification. All scripts, schemas, tests, templates, and prose are original; no source code or prose was copied from either prior-art project. See [`ATTRIBUTION.md`](ATTRIBUTION.md) for authors, licenses, exact references, and provenance.
 
 Multiple agents do not need a group chat. They need separate worktrees, explicit territory and a receipt before anything merges.
+
+## Terminology & prior art
+This pattern is known in the field as [worktree isolation](https://code.claude.com/docs/en/worktrees), related to the [principle of least privilege](https://csrc.nist.gov/glossary/term/least_privilege).
+This implementation adds one worktree per writer, bounded task contracts, and evidence-backed merge receipts.
